@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>FloatingTerminal</string>
     <key>CFBundleIdentifier</key>
-    <string>com.binpwn.floatingterminal</string>
+    <string>com.catpaw.floatingterminal</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

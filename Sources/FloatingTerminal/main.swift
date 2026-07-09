@@ -1,5 +1,12 @@
 import AppKit
+import Darwin
 import Foundation
+
+// Swift marks fork() unavailable to discourage misuse with threads, but we
+// need the real POSIX fork() to set up the PTY controlling terminal before
+// exec'ing the shell. We call the underlying C symbol directly.
+@_silgen_name("fork")
+private func posixFork() -> pid_t
 
 final class HoverPanel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -51,72 +58,265 @@ final class HoverPanel: NSPanel {
 
 }
 
+/// Runs shell commands attached to a real pseudo-terminal (PTY) instead of a
+/// plain pipe. This is required for interactive programs like `python3`,
+/// `ssh`, `vim`, pagers, etc. — they check `isatty()` on their stdout and
+/// switch to line-buffered/raw behavior (prompts, colors, cursor control)
+/// only when connected to a TTY. A plain Pipe makes them fully-buffered,
+/// which is why output like the Python `>>>` prompt never showed up.
 final class CommandExecutor {
-    private var process: Process?
-    private var pipe: Pipe?
+    /// Child process ID (-1 when not running).
+    private var childPID: pid_t = -1
+    private var masterHandle: FileHandle?
+    private var childWatchSource: DispatchSourceProcess?
+    /// Leftover bytes from a previous read that didn't end on a UTF-8
+    /// character boundary. Held until more data arrives so multi-byte
+    /// characters (e.g. Chinese) aren't split and rendered as '?'.
+    private var pendingData = Data()
 
     var onOutput: ((String) -> Void)?
     var onComplete: (() -> Void)?
 
-    var isRunning: Bool { process != nil }
+    var isRunning: Bool { childPID != -1 }
 
     func run(command: String, workingDirectory: URL) {
-        guard process == nil else {
+        guard childPID == -1 else {
             onOutput?("A command is already running.\n")
             onComplete?()
             return
         }
 
-        let task = Process()
-        let outputPipe = Pipe()
+        var masterFD: Int32 = -1
+        var slaveFD: Int32 = -1
+        var winSize = winsize(ws_row: 40, ws_col: 120, ws_xpixel: 0, ws_ypixel: 0)
 
-        task.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        task.arguments = ["-l", "-c", command]
-        task.currentDirectoryURL = workingDirectory
-        task.environment = ProcessInfo.processInfo.environment
-        task.standardOutput = outputPipe
-        task.standardError = outputPipe
+        guard openpty(&masterFD, &slaveFD, nil, nil, &winSize) == 0 else {
+            onOutput?("Failed to allocate a pseudo-terminal.\n")
+            onComplete?()
+            return
+        }
 
-        process = task
-        pipe = outputPipe
+        // Build environment for the child.
+        var env = ProcessInfo.processInfo.environment
+        env["TERM"] = "xterm-256color"
+        env["LANG"] = "en_US.UTF-8"
+        env["LC_ALL"] = "en_US.UTF-8"
+        let userName = ProcessInfo.processInfo.userName
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
+        if env["USER"] == nil || env["USER"]!.isEmpty { env["USER"] = userName }
+        if env["LOGNAME"] == nil || env["LOGNAME"]!.isEmpty { env["LOGNAME"] = userName }
+        if env["HOME"] == nil || env["HOME"]!.isEmpty { env["HOME"] = homeDir }
+        // Remove any askpass helpers – sudo must read via the PTY tty.
+        env.removeValue(forKey: "SUDO_ASKPASS")
+        env.removeValue(forKey: "SSH_ASKPASS")
 
-        let readHandle = outputPipe.fileHandleForReading
-        let outputCallback = self.onOutput
+        // Convert env dict to C-string array expected by execve.
+        let envCStrings: [UnsafeMutablePointer<CChar>?] = env.map { k, v in
+            strdup("\(k)=\(v)")
+        } + [nil]
+        defer { envCStrings.forEach { if let p = $0 { free(p) } } }
 
-        // Read all output until EOF, THEN call completion.
-        // This fixes the race where terminationHandler fired before
-        // buffered output was drained.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            while true {
-                let data = readHandle.availableData
-                if data.isEmpty { break }
-                let chunk = String(decoding: data, as: UTF8.self)
-                DispatchQueue.main.async {
-                    outputCallback?(chunk)
+        // argv: /bin/zsh -l -c <command>
+        // The command appears in argv (visible via ps), which is identical to
+        // how Terminal.app and iTerm2 behave — this is expected and harmless.
+        let argv: [UnsafeMutablePointer<CChar>?] = [
+            strdup("/bin/zsh"),
+            strdup("-l"),
+            strdup("-c"),
+            strdup(command),
+            nil
+        ]
+        defer { argv.forEach { if let p = $0 { free(p) } } }
+
+        let cwdPath = workingDirectory.path
+
+        // fork() — child sets up PTY as controlling terminal then exec's.
+        let pid = posixFork()
+        guard pid >= 0 else {
+            close(masterFD); close(slaveFD)
+            onOutput?("fork() failed: \(String(cString: strerror(errno)))\n")
+            onComplete?()
+            return
+        }
+
+        if pid == 0 {
+            // ── Child process ──────────────────────────────────────────────
+            // 1. Become a new session leader (detach from parent's tty).
+            _ = setsid()
+
+            // 2. Make the slave PTY the controlling terminal of this session.
+            //    TIOCSCTTY is available on macOS (value 0x20007461).
+            _ = ioctl(slaveFD, UInt(TIOCSCTTY), 1 as Int32)
+
+            // 3. Wire slave PTY to stdin/stdout/stderr.
+            dup2(slaveFD, STDIN_FILENO)
+            dup2(slaveFD, STDOUT_FILENO)
+            dup2(slaveFD, STDERR_FILENO)
+
+            // 4. Close all other descriptors (master + original slave copy).
+            var maxFD = Int32(getdtablesize())
+            if maxFD < 0 { maxFD = 1024 }
+            var fd: Int32 = 3
+            while fd < maxFD { close(fd); fd += 1 }
+
+            // 5. Change working directory.
+            _ = chdir(cwdPath)
+
+            // 6. exec the shell.
+            envCStrings.withUnsafeBufferPointer { envPtr in
+                argv.withUnsafeBufferPointer { argvPtr in
+                    _ = execve("/bin/zsh",
+                               argvPtr.baseAddress!,
+                               envPtr.baseAddress!)
                 }
             }
-            // Pipe is closed (EOF) — all output has been read.
-            // Wait for process to fully exit.
-            task.waitUntilExit()
+            // exec failed – exit child immediately.
+            _exit(127)
+        }
+
+        // ── Parent process ────────────────────────────────────────────────
+        close(slaveFD)   // Parent doesn't need the slave end.
+
+        childPID = pid
+        let master = FileHandle(fileDescriptor: masterFD, closeOnDealloc: true)
+        masterHandle = master
+
+        // Watch the master PTY for output from the child.
+        master.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            self?.flushOutput(data)
+        }
+
+        // Watch for child exit using a DispatchSource so we don't block.
+        let src = DispatchSource.makeProcessSource(
+            identifier: pid,
+            eventMask: .exit,
+            queue: DispatchQueue.global()
+        )
+        src.setEventHandler { [weak self] in
+            // Reap child to avoid zombie.
+            var status: Int32 = 0
+            waitpid(pid, &status, 0)
             DispatchQueue.main.async {
-                self?.process = nil
-                self?.pipe = nil
+                self?.teardown()
                 self?.onComplete?()
             }
         }
+        src.resume()
+        childWatchSource = src
+    }
 
-        do {
-            try task.run()
-        } catch {
-            process = nil
-            pipe = nil
-            onOutput?("Failed to launch: \(error.localizedDescription)\n")
-            onComplete?()
-        }
+    /// Sends a line of input to the running program's stdin (via the PTY).
+    func sendInput(_ text: String) {
+        guard let master = masterHandle else { return }
+        var line = text
+        if !line.hasSuffix("\n") { line += "\n" }
+        if let data = line.data(using: .utf8) { master.write(data) }
+    }
+
+    /// Sends raw bytes to the PTY without appending a newline.
+    func sendRaw(_ text: String) {
+        guard let master = masterHandle else { return }
+        if let data = text.data(using: .utf8) { master.write(data) }
+    }
+
+    /// Sends a raw control byte (e.g. Ctrl+C = 0x03) directly to the PTY.
+    func sendControlCharacter(_ byte: UInt8) {
+        guard let master = masterHandle else { return }
+        master.write(Data([byte]))
     }
 
     func stop() {
-        process?.terminate()
+        sendControlCharacter(0x03)
+        if childPID != -1 { kill(childPID, SIGTERM) }
+    }
+
+    private func teardown() {
+        childWatchSource?.cancel()
+        childWatchSource = nil
+        masterHandle?.readabilityHandler = nil
+        masterHandle = nil
+        childPID = -1
+        pendingData = Data()
+    }
+
+    /// Decodes the accumulated PTY bytes into a String, keeping any trailing
+    /// incomplete UTF-8 sequence for the next read. Also normalizes CRLF
+    /// (PTY's OPOST turns `\n` into `\r\n`) and lone `\r` into plain `\n`,
+    /// since NSTextView isn't a real terminal and would otherwise show `\r`
+    /// as garbage / misaligned content.
+    private func flushOutput(_ data: Data) {
+        pendingData.append(data)
+
+        // Find the longest prefix that decodes cleanly as UTF-8. We do this
+        // by trimming trailing continuation bytes (0x80..0xBF) that don't
+        // yet form a complete multi-byte sequence, then verifying with
+        // String(data:encoding:) which returns nil for invalid UTF-8.
+        var decodeEnd = pendingData.count
+
+        // Trim incomplete trailing sequence: walk back over continuation
+        // bytes to find the last leading byte, then check if its expected
+        // length is fully present.
+        let bytes = [UInt8](pendingData)
+        if !bytes.isEmpty {
+            var idx = bytes.count - 1
+            // Skip continuation bytes (10xxxxxx = 0x80..0xBF)
+            while idx >= 0 && bytes[idx] >= 0x80 && bytes[idx] < 0xC0 {
+                idx -= 1
+            }
+            if idx >= 0 {
+                let lead = bytes[idx]
+                let expected: Int
+                if lead < 0x80 { expected = 1 }
+                else if lead < 0xE0 { expected = 2 }
+                else if lead < 0xF0 { expected = 3 }
+                else { expected = 4 }
+                let have = bytes.count - idx
+                if have < expected {
+                    // Incomplete multi-byte char at the tail; hold it back.
+                    decodeEnd = idx
+                }
+            }
+        }
+
+        // Verify the chosen prefix truly decodes; if not (e.g. an invalid
+        // byte sequence that isn't just truncated), fall back to decoding
+        // everything with lossy replacement so we don't stall forever.
+        var toDecode: Data
+        if decodeEnd == pendingData.count {
+            toDecode = pendingData
+            pendingData = Data()
+        } else {
+            toDecode = pendingData.prefix(decodeEnd)
+            pendingData = pendingData.suffix(pendingData.count - decodeEnd)
+        }
+
+        guard !toDecode.isEmpty else { return }
+
+        var chunk: String
+        if let s = String(data: toDecode, encoding: .utf8) {
+            chunk = s
+        } else {
+            // Lossy fallback: decode what we can (replaces bad bytes with
+            // U+FFFD) and drop the buffer so we don't loop on bad data.
+            chunk = String(decoding: toDecode, as: UTF8.self)
+            pendingData = Data()
+        }
+
+        // Normalize PTY line endings: OPOST converts \n -> \r\n; collapse
+        // \r\n back to \n so the ANSI processor sees clean line feeds.
+        // Lone \r (not followed by \n) is kept as-is — it means carriage
+        // return (overwrite current line) and is handled by the processor.
+        chunk = chunk.replacingOccurrences(of: "\r\n", with: "\n")
+
+        let outputCallback = self.onOutput
+        DispatchQueue.main.async {
+            outputCallback?(chunk)
+        }
     }
 }
 
@@ -131,6 +331,11 @@ final class TerminalViewController: NSViewController, NSTextViewDelegate {
     private var inputStartIndex = 0
     private var isAppendingProgrammatically = false
     private var isUpdatingSelection = false
+    /// Emulated cursor position in the rendered output (UTF-16 offset).
+    private var outputCursorIndex = 0
+    /// Incomplete terminal control sequence split across PTY read chunks.
+    private var pendingControlSequence = ""
+    private var keyEventMonitor: Any?
 
     /// Exposed so the hosting panel can guard copy/paste to the input region.
     var editableInputStart: Int { inputStartIndex }
@@ -154,6 +359,12 @@ final class TerminalViewController: NSViewController, NSTextViewDelegate {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        if let monitor = keyEventMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+    }
 
     override func loadView() {
         let rootView = NSView()
@@ -211,14 +422,91 @@ final class TerminalViewController: NSViewController, NSTextViewDelegate {
         appendPrompt()
 
         executor.onOutput = { [weak self] chunk in
-            self?.appendText(chunk, color: self?.textColor ?? .white)
+            self?.handleProcessOutput(chunk)
         }
+
+        installInteractiveKeyMonitor()
     }
 
     func focusTerminal() {
         view.window?.makeFirstResponder(terminalView)
         let end = (terminalView.string as NSString).length
         terminalView.setSelectedRange(NSRange(location: end, length: 0))
+    }
+
+    private func installInteractiveKeyMonitor() {
+        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            guard executor.isRunning else { return event }
+            guard event.window === self.view.window else { return event }
+            guard self.view.window?.firstResponder === self.terminalView else { return event }
+
+            if self.handleInteractiveKeyDown(event) {
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func handleInteractiveKeyDown(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        // Keep Command shortcuts (copy/paste/select all) routed through the
+        // normal key equivalent path handled by HoverPanel.
+        if modifiers.contains(.command) {
+            return false
+        }
+
+        if modifiers.contains(.control),
+           (event.charactersIgnoringModifiers?.lowercased() ?? "") == "c" {
+            executor.sendControlCharacter(0x03)
+            return true
+        }
+
+        switch event.keyCode {
+        case 36, 76: // Return / keypad Enter
+            executor.sendRaw("\r")
+            return true
+        case 48: // Tab
+            executor.sendRaw("\t")
+            return true
+        case 51: // Backspace
+            executor.sendControlCharacter(0x7f)
+            return true
+        case 117: // Forward delete
+            executor.sendRaw("\u{1b}[3~")
+            return true
+        case 123: // Left
+            executor.sendRaw("\u{1b}[D")
+            return true
+        case 124: // Right
+            executor.sendRaw("\u{1b}[C")
+            return true
+        case 125: // Down
+            executor.sendRaw("\u{1b}[B")
+            return true
+        case 126: // Up
+            executor.sendRaw("\u{1b}[A")
+            return true
+        case 115: // Home
+            executor.sendRaw("\u{1b}OH")
+            return true
+        case 119: // End
+            executor.sendRaw("\u{1b}OF")
+            return true
+        case 53: // Esc
+            executor.sendControlCharacter(0x1b)
+            return true
+        default:
+            break
+        }
+
+        if let chars = event.characters, !chars.isEmpty {
+            executor.sendRaw(chars)
+            return true
+        }
+
+        return true
     }
 
     // MARK: - Terminal rendering
@@ -244,6 +532,7 @@ final class TerminalViewController: NSViewController, NSTextViewDelegate {
         isAppendingProgrammatically = true
         terminalView.textStorage?.append(attr)
         isAppendingProgrammatically = false
+        outputCursorIndex = (terminalView.string as NSString).length
         terminalView.scrollToEndOfDocument(nil)
     }
 
@@ -254,9 +543,397 @@ final class TerminalViewController: NSViewController, NSTextViewDelegate {
         terminalView.setSelectedRange(NSRange(location: end, length: 0))
     }
 
+    /// Handles output arriving from the running process (via the PTY).
+    /// This keeps a lightweight terminal cursor model so interactive editors
+    /// (python readline, vim, etc.) can move within the current line instead
+    /// of being treated as append-only text.
+    private func handleProcessOutput(_ chunk: String) {
+        guard let textStorage = terminalView.textStorage else { return }
+
+        let mergedChunk: String
+        if pendingControlSequence.isEmpty {
+            mergedChunk = chunk
+        } else {
+            mergedChunk = pendingControlSequence + chunk
+            pendingControlSequence = ""
+        }
+
+        func documentLength() -> Int {
+            (terminalView.string as NSString).length
+        }
+
+        func clampCursor() {
+            outputCursorIndex = max(0, min(outputCursorIndex, documentLength()))
+        }
+
+        func withProgrammaticEdit(_ body: () -> Void) {
+            isAppendingProgrammatically = true
+            body()
+            isAppendingProgrammatically = false
+        }
+
+        func lineStart(for location: Int, in full: NSString) -> Int {
+            var idx = max(0, min(location, full.length))
+            while idx > 0 {
+                if full.character(at: idx - 1) == 0x0A { break }
+                idx -= 1
+            }
+            return idx
+        }
+
+        func lineEnd(for location: Int, in full: NSString) -> Int {
+            var idx = max(0, min(location, full.length))
+            while idx < full.length {
+                if full.character(at: idx) == 0x0A { break }
+                idx += 1
+            }
+            return idx
+        }
+
+        func moveLeft(_ count: Int) {
+            guard count > 0 else { return }
+            clampCursor()
+            let full = terminalView.string as NSString
+            var remaining = count
+            while remaining > 0, outputCursorIndex > 0 {
+                let range = full.rangeOfComposedCharacterSequence(at: outputCursorIndex - 1)
+                outputCursorIndex = range.location
+                remaining -= 1
+            }
+        }
+
+        func moveRight(_ count: Int) {
+            guard count > 0 else { return }
+            clampCursor()
+            let full = terminalView.string as NSString
+            var remaining = count
+            while remaining > 0, outputCursorIndex < full.length {
+                let range = full.rangeOfComposedCharacterSequence(at: outputCursorIndex)
+                outputCursorIndex = range.location + range.length
+                remaining -= 1
+            }
+        }
+
+        func moveToLineStart() {
+            clampCursor()
+            let full = terminalView.string as NSString
+            outputCursorIndex = lineStart(for: outputCursorIndex, in: full)
+        }
+
+        func insertLineFeed() {
+            // A line feed (\n or \r\n) appends a newline at the cursor
+            // position if we are at end-of-document, or moves the cursor
+            // down one line (preserving column) if there is a next line.
+            clampCursor()
+            let full = terminalView.string as NSString
+            if outputCursorIndex >= full.length {
+                withProgrammaticEdit {
+                    textStorage.replaceCharacters(
+                        in: NSRange(location: outputCursorIndex, length: 0),
+                        with: "\n")
+                }
+                outputCursorIndex += 1
+            } else if full.character(at: outputCursorIndex) == 0x0A {
+                outputCursorIndex += 1
+            } else {
+                withProgrammaticEdit {
+                    textStorage.replaceCharacters(
+                        in: NSRange(location: outputCursorIndex, length: 0),
+                        with: "\n")
+                }
+                outputCursorIndex += 1
+            }
+        }
+
+        func moveVertical(_ delta: Int) {
+            guard delta != 0 else { return }
+            clampCursor()
+            let full = terminalView.string as NSString
+            var cursor = outputCursorIndex
+            let currentStart = lineStart(for: cursor, in: full)
+            let currentEnd = lineEnd(for: cursor, in: full)
+            let column = min(cursor - currentStart, currentEnd - currentStart)
+
+            if delta > 0 {
+                var lines = delta
+                var scan = currentEnd
+                while lines > 0, scan < full.length {
+                    if full.character(at: scan) == 0x0A {
+                        scan += 1
+                        lines -= 1
+                    } else {
+                        scan += 1
+                    }
+                }
+                let targetStart = min(scan, full.length)
+                let targetEnd = lineEnd(for: targetStart, in: full)
+                cursor = min(targetStart + column, targetEnd)
+            } else {
+                var lines = -delta
+                var scan = currentStart
+                while lines > 0, scan > 0 {
+                    scan -= 1
+                    if full.character(at: scan) == 0x0A {
+                        lines -= 1
+                    }
+                }
+                let targetStart = lineStart(for: scan, in: full)
+                let targetEnd = lineEnd(for: targetStart, in: full)
+                cursor = min(targetStart + column, targetEnd)
+            }
+
+            outputCursorIndex = max(0, min(cursor, full.length))
+        }
+
+        func putCharacter(_ char: String) {
+            guard !char.isEmpty else { return }
+            clampCursor()
+            let full = terminalView.string as NSString
+            let charLen = (char as NSString).length
+
+            if outputCursorIndex >= full.length {
+                withProgrammaticEdit {
+                    textStorage.replaceCharacters(in: NSRange(location: outputCursorIndex, length: 0), with: char)
+                }
+                outputCursorIndex += charLen
+                return
+            }
+
+            if full.character(at: outputCursorIndex) == 0x0A {
+                withProgrammaticEdit {
+                    textStorage.replaceCharacters(in: NSRange(location: outputCursorIndex, length: 0), with: char)
+                }
+                outputCursorIndex += charLen
+                return
+            }
+
+            let replaceRange = full.rangeOfComposedCharacterSequence(at: outputCursorIndex)
+            withProgrammaticEdit {
+                textStorage.replaceCharacters(in: replaceRange, with: char)
+            }
+            outputCursorIndex = replaceRange.location + charLen
+        }
+
+        func insertNewline() {
+            clampCursor()
+            withProgrammaticEdit {
+                textStorage.replaceCharacters(
+                    in: NSRange(location: outputCursorIndex, length: 0),
+                    with: "\n")
+            }
+            outputCursorIndex += 1
+        }
+
+        func eraseInLine(mode: Int) {
+            clampCursor()
+            let full = terminalView.string as NSString
+            let start = lineStart(for: outputCursorIndex, in: full)
+            let end = lineEnd(for: outputCursorIndex, in: full)
+            guard end >= start else { return }
+
+            let range: NSRange
+            switch mode {
+            case 1:
+                let len = max(0, outputCursorIndex - start)
+                range = NSRange(location: start, length: len)
+            case 2:
+                range = NSRange(location: start, length: end - start)
+            default:
+                range = NSRange(location: outputCursorIndex, length: end - outputCursorIndex)
+            }
+
+            guard range.length > 0 else { return }
+            withProgrammaticEdit {
+                textStorage.replaceCharacters(in: range, with: "")
+            }
+            if mode == 1 || mode == 2 {
+                outputCursorIndex = max(start, outputCursorIndex - range.length)
+            }
+        }
+
+        func deleteChars(_ count: Int) {
+            guard count > 0 else { return }
+            clampCursor()
+            let full = terminalView.string as NSString
+            let end = lineEnd(for: outputCursorIndex, in: full)
+            let len = min(count, max(0, end - outputCursorIndex))
+            guard len > 0 else { return }
+            withProgrammaticEdit {
+                textStorage.replaceCharacters(in: NSRange(location: outputCursorIndex, length: len), with: "")
+            }
+        }
+
+        func moveToColumn(_ column: Int) {
+            clampCursor()
+            let full = terminalView.string as NSString
+            let start = lineStart(for: outputCursorIndex, in: full)
+            let end = lineEnd(for: outputCursorIndex, in: full)
+            let zeroBased = max(0, column - 1)
+            outputCursorIndex = min(start + zeroBased, end)
+        }
+
+        func clearDisplay(mode: Int) {
+            let length = documentLength()
+            guard length > 0 else { return }
+            switch mode {
+            case 2:
+                withProgrammaticEdit {
+                    textStorage.replaceCharacters(in: NSRange(location: 0, length: length), with: "")
+                }
+                outputCursorIndex = 0
+            default:
+                break
+            }
+        }
+
+        func parseCSIParams(_ body: String) -> [Int] {
+            let trimmed = body.trimmingCharacters(in: CharacterSet(charactersIn: "?"))
+            if trimmed.isEmpty { return [] }
+            return trimmed.split(separator: ";").map { part in
+                let digits = part.filter { $0.isNumber }
+                return Int(digits) ?? 0
+            }
+        }
+
+        func applyCSI(body: String, final: UnicodeScalar) {
+            let params = parseCSIParams(body)
+            let first = params.first ?? 0
+            switch final {
+            case "A":
+                moveVertical(-(first == 0 ? 1 : first))
+            case "B":
+                moveVertical(first == 0 ? 1 : first)
+            case "C":
+                moveRight(first == 0 ? 1 : first)
+            case "D":
+                moveLeft(first == 0 ? 1 : first)
+            case "G":
+                moveToColumn(first == 0 ? 1 : first)
+            case "K":
+                eraseInLine(mode: first)
+            case "P":
+                deleteChars(first == 0 ? 1 : first)
+            case "J":
+                clearDisplay(mode: first)
+            default:
+                break
+            }
+        }
+
+        func scalarSliceToString(_ slice: ArraySlice<UnicodeScalar>) -> String {
+            String(String.UnicodeScalarView(slice))
+        }
+
+        clampCursor()
+
+        let scalars = Array(mergedChunk.unicodeScalars)
+        var index = 0
+        while index < scalars.count {
+            let scalar = scalars[index]
+            switch scalar.value {
+            case 0x08:
+                // Typical tty delete echo is "\b \b". Collapse it into an
+                // actual delete so model text stays consistent with display.
+                if index + 2 < scalars.count,
+                   scalars[index + 1].value == 0x20,
+                   scalars[index + 2].value == 0x08 {
+                    moveLeft(1)
+                    deleteChars(1)
+                    index += 3
+                } else {
+                    // Plain backspace is cursor-left (used by readline moves).
+                    moveLeft(1)
+                    index += 1
+                }
+            case 0x0D:
+                // Carriage return: move cursor to start of current line.
+                // After \r\n normalization in flushOutput, lone \r means
+                // "overwrite current line from column 0".
+                moveToLineStart()
+                index += 1
+            case 0x0A:
+                insertLineFeed()
+                index += 1
+            case 0x1B:
+                guard index + 1 < scalars.count else {
+                    pendingControlSequence = scalarSliceToString(scalars[index...])
+                    index = scalars.count
+                    continue
+                }
+
+                let next = scalars[index + 1]
+                if next == "[" {
+                    var end = index + 2
+                    while end < scalars.count {
+                        let value = scalars[end].value
+                        if value >= 0x40, value <= 0x7E { break }
+                        end += 1
+                    }
+                    if end < scalars.count {
+                        let body = String(String.UnicodeScalarView(scalars[(index + 2)..<end]))
+                        applyCSI(body: body, final: scalars[end])
+                        index = end + 1
+                    } else {
+                        pendingControlSequence = scalarSliceToString(scalars[index...])
+                        index = scalars.count
+                    }
+                } else if next == "]" {
+                    // OSC: consume until BEL or ST (ESC \).
+                    var end = index + 2
+                    var terminated = false
+                    while end < scalars.count {
+                        let value = scalars[end].value
+                        if value == 0x07 {
+                            end += 1
+                            terminated = true
+                            break
+                        }
+                        if value == 0x1B, end + 1 < scalars.count, scalars[end + 1].value == 0x5C {
+                            end += 2
+                            terminated = true
+                            break
+                        }
+                        end += 1
+                    }
+                    if terminated {
+                        index = end
+                    } else {
+                        pendingControlSequence = scalarSliceToString(scalars[index...])
+                        index = scalars.count
+                    }
+                } else {
+                    // Other two-byte ESC sequences are not rendered.
+                    index += 2
+                }
+            default:
+                if scalar.value >= 0x20 || scalar.value == 0x09 {
+                    putCharacter(String(scalar))
+                }
+                index += 1
+            }
+        }
+
+        inputStartIndex = outputCursorIndex
+        terminalView.setSelectedRange(NSRange(location: outputCursorIndex, length: 0))
+        terminalView.scrollRangeToVisible(NSRange(location: outputCursorIndex, length: 0))
+    }
+
     // MARK: - Command execution
 
     private func executeCommand(_ raw: String) {
+        // If a program is already running (e.g. python3 REPL, ssh, a pager),
+        // pressing Enter should feed the typed line to that program's stdin
+        // via the PTY instead of being interpreted as a new shell command.
+        if executor.isRunning {
+            appendText("\n", color: textColor)
+            executor.sendInput(raw)
+            // The next line of interactive input starts right after what we
+            // just "sent" (echoed by the PTY itself in most cases, but we
+            // still need a local edit boundary).
+            inputStartIndex = (terminalView.string as NSString).length
+            return
+        }
+
         let command = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         appendText("\n", color: textColor)
 
@@ -344,14 +1021,47 @@ final class TerminalViewController: NSViewController, NSTextViewDelegate {
 
     func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
         if isAppendingProgrammatically { return true }
-        if executor.isRunning { return false }
-        if replacementString == nil { return true }
+        guard let replacement = replacementString else { return true }
+
+        // PTY interactive mode: a child program (python3, ssh, etc.) owns
+        // the terminal. Don't insert anything into the local text view —
+        // forward every byte to the PTY and let its ECHO (the kernel line
+        // discipline or the program itself) render the characters back to
+        // us through handleProcessOutput. This is exactly how a real
+        // terminal works and eliminates the double-echo we used to get when
+        // both the app and the PTY displayed the same keystroke.
+        if executor.isRunning {
+            if !replacement.isEmpty {
+                let isAllowed = replacement.unicodeScalars.allSatisfy { scalar in
+                    let value = scalar.value
+                    if value == 0x09 || value == 0x0A || value == 0x0D {
+                        return true
+                    }
+                    if value < 0x20 || value == 0x7F {
+                        return false
+                    }
+                    if (0xF700...0xF8FF).contains(value) {
+                        return false
+                    }
+                    return true
+                }
+                if isAllowed {
+                    executor.sendRaw(replacement)
+                }
+            }
+            return false
+        }
+
+        // Idle mode (shell prompt): editing is only allowed from
+        // inputStartIndex onward.
         return affectedCharRange.location >= inputStartIndex
     }
 
     func textViewDidChangeSelection(_ notification: Notification) {
-        if executor.isRunning { return }
         if isUpdatingSelection { return }
+        // When a process is running, the ANSI cursor model owns the caret
+        // position — don't fight it by snapping back to the end.
+        if executor.isRunning { return }
         let sel = terminalView.selectedRange()
         // Only snap the caret (zero-length selection) back into the input
         // region. Allow non-zero selections in history so the user can
@@ -365,6 +1075,61 @@ final class TerminalViewController: NSViewController, NSTextViewDelegate {
     }
 
     func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        // ---- PTY interactive mode ----
+        // Forward special keys to the PTY as escape sequences / control
+        // bytes. The PTY's ECHO and the child program (e.g. readline in
+        // python3) handle all on-screen feedback, so we never modify the
+        // local text view here.
+        if executor.isRunning {
+            switch commandSelector {
+            case #selector(NSResponder.insertNewline(_:)):
+                executor.sendRaw("\n")
+                return true
+            case #selector(NSResponder.insertTab(_:)):
+                executor.sendRaw("\t")
+                return true
+            case #selector(NSResponder.insertBacktab(_:)):
+                executor.sendRaw("\u{1b}[Z")  // Shift-Tab
+                return true
+            case #selector(NSResponder.deleteBackward(_:)):
+                executor.sendControlCharacter(0x7f)  // DEL (backspace)
+                return true
+            case #selector(NSResponder.deleteForward(_:)):
+                executor.sendRaw("\u{1b}[3~")  // Delete key
+                return true
+            case #selector(NSResponder.moveUp(_:)):
+                executor.sendRaw("\u{1b}[A")
+                return true
+            case #selector(NSResponder.moveDown(_:)):
+                executor.sendRaw("\u{1b}[B")
+                return true
+            case #selector(NSResponder.moveLeft(_:)):
+                executor.sendRaw("\u{1b}[D")
+                return true
+            case #selector(NSResponder.moveRight(_:)):
+                executor.sendRaw("\u{1b}[C")
+                return true
+            case #selector(NSResponder.moveToBeginningOfLine(_:)):
+                executor.sendRaw("\u{1b}OH")  // Home
+                return true
+            case #selector(NSResponder.moveToEndOfLine(_:)):
+                executor.sendRaw("\u{1b}OF")  // End
+                return true
+            case #selector(NSResponder.cancelOperation(_:)):
+                // Ctrl+C — let the child handle SIGINT (e.g. python3 shows
+                // KeyboardInterrupt). Don't force-terminate; the program
+                // decides whether to exit.
+                executor.sendControlCharacter(0x03)
+                return true
+            default:
+                break
+            }
+            // For any other selector, swallow it so the text view doesn't
+            // modify its contents locally while in PTY mode.
+            return true
+        }
+
+        // ---- Idle mode (shell prompt) ----
         if commandSelector == #selector(NSResponder.insertTab(_:)) {
             performTabCompletion()
             return true
@@ -387,12 +1152,7 @@ final class TerminalViewController: NSViewController, NSTextViewDelegate {
             return true
         }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-            if executor.isRunning {
-                executor.stop()
-                appendText("^C\n", color: errorColor)
-            } else {
-                onHideRequested?()
-            }
+            onHideRequested?()
             return true
         }
         return false
@@ -428,7 +1188,6 @@ final class TerminalViewController: NSViewController, NSTextViewDelegate {
         }
 
         let parts = currentInput.split(separator: " ", omittingEmptySubsequences: false)
-        let cmdPart = String(parts[0])
         let lastArg = parts.count > 1 ? String(parts.last!) : ""
         let argPrefix = parts.count > 1 ? parts.dropLast().map { String($0) }.joined(separator: " ") + " " : ""
 
@@ -667,12 +1426,27 @@ final class FloatingTerminalController {
         showPanel(on: screen)
     }
 
+    /// The screen the panel is currently displayed on (tracked so we can
+    /// detect when the user moves the cursor to a *different* screen's
+    /// trigger zone and needs the panel repositioned there).
+    private var panelScreen: NSScreen?
+
     private func updatePanelVisibility() {
         let mouseLocation = NSEvent.mouseLocation
         let currentScreen = screenContaining(mouseLocation)
         let inTriggerZone = currentScreen.map { triggerRect(on: $0).contains(mouseLocation) } ?? false
-        let insidePanel = panel.isVisible && panel.frame.insetBy(dx: -trackingPadding, dy: -trackingPadding).contains(mouseLocation)
-        let withinHandoff = panel.isVisible && Date().timeIntervalSince(lastTriggerTime) < handoffDuration
+
+        // If the panel is visible but the mouse is in a *different* screen's
+        // trigger zone, treat it as a new trigger (reposition to that screen).
+        let onDifferentScreen = panel.isVisible && inTriggerZone
+            && currentScreen != nil && currentScreen != panelScreen
+
+        let insidePanel = panel.isVisible
+            && !onDifferentScreen
+            && panel.frame.insetBy(dx: -trackingPadding, dy: -trackingPadding).contains(mouseLocation)
+        let withinHandoff = panel.isVisible
+            && !onDifferentScreen
+            && Date().timeIntervalSince(lastTriggerTime) < handoffDuration
 
         if inTriggerZone, let screen = currentScreen {
             lastTriggerTime = Date()
@@ -689,9 +1463,19 @@ final class FloatingTerminalController {
 
     private func showPanel(on screen: NSScreen) {
         let desiredFrame = panelFrame(on: screen)
-        if panel.frame != desiredFrame {
+        let screenChanged = panelScreen != screen
+
+        if panel.frame != desiredFrame || screenChanged {
+            // Moving to a different screen: hide first so the window doesn't
+            // appear to slide across screens, then reposition and fade in.
+            if screenChanged && panel.isVisible {
+                panel.orderOut(nil)
+            }
             panel.setFrame(desiredFrame, display: true)
         }
+
+        panelScreen = screen
+
         if !panel.isVisible {
             panel.alphaValue = 0
             panel.orderFrontRegardless()
@@ -710,6 +1494,7 @@ final class FloatingTerminalController {
     private func hidePanel() {
         guard panel.isVisible else { return }
         panel.orderOut(nil)
+        panelScreen = nil
     }
 
     private func screenContaining(_ point: NSPoint) -> NSScreen? {
@@ -744,8 +1529,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let terminalController = FloatingTerminalController()
     private var statusItem: NSStatusItem?
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        _ = NSApp.setActivationPolicy(.accessory)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        _ = NSApp.setActivationPolicy(.accessory)
         setupStatusItem()
+
+        // If created too early and no button was attached yet, retry once on
+        // the next run loop tick so the icon is guaranteed to appear.
+        if statusItem?.button == nil {
+            statusItem = nil
+            DispatchQueue.main.async { [weak self] in
+                self?.setupStatusItem()
+            }
+        }
+
         terminalController.start()
     }
 
@@ -762,9 +1562,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupStatusItem() {
+        if let existing = statusItem, existing.button != nil {
+            return
+        }
+        if let existing = statusItem {
+            NSStatusBar.system.removeStatusItem(existing)
+        }
+
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: "Floating Terminal")
+            if let icon = NSImage(systemSymbolName: "terminal", accessibilityDescription: "Floating Terminal") {
+                icon.isTemplate = true
+                button.image = icon
+            } else {
+                button.title = "FT"
+            }
             button.toolTip = "Floating Terminal"
         }
 
