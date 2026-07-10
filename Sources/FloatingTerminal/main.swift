@@ -1527,24 +1527,34 @@ final class FloatingTerminalController {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let terminalController = FloatingTerminalController()
-    private var statusItem: NSStatusItem?
-
-    func applicationWillFinishLaunching(_ notification: Notification) {
-        _ = NSApp.setActivationPolicy(.accessory)
-    }
+    // Keep a strong reference so the item isn't deallocated.
+    private var statusItem: NSStatusItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        _ = NSApp.setActivationPolicy(.accessory)
-        setupStatusItem()
-
-        // If created too early and no button was attached yet, retry once on
-        // the next run loop tick so the icon is guaranteed to appear.
-        if statusItem?.button == nil {
-            statusItem = nil
-            DispatchQueue.main.async { [weak self] in
-                self?.setupStatusItem()
+        // Create the menu-bar status item before anything else so it appears
+        // as early as possible. We must NOT call setActivationPolicy(.accessory)
+        // before creating the status item, because on some macOS versions that
+        // suppresses the status bar slot allocation.
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = item.button {
+            if let icon = NSImage(systemSymbolName: "terminal", accessibilityDescription: "Floating Terminal") {
+                icon.isTemplate = true
+                button.image = icon
+            } else {
+                button.title = "FT"
             }
+            button.toolTip = "Floating Terminal"
         }
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Show Terminal", action: #selector(showPanelNow), keyEquivalent: ""))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Floating Terminal", action: #selector(quitApp), keyEquivalent: "q"))
+        menu.items.forEach { $0.target = self }
+        item.menu = menu
+        statusItem = item
+
+        // Switch to accessory (no Dock icon) AFTER the status item is live.
+        NSApp.setActivationPolicy(.accessory)
 
         terminalController.start()
     }
@@ -1560,38 +1570,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func quitApp() {
         NSApp.terminate(nil)
     }
-
-    private func setupStatusItem() {
-        if let existing = statusItem, existing.button != nil {
-            return
-        }
-        if let existing = statusItem {
-            NSStatusBar.system.removeStatusItem(existing)
-        }
-
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = item.button {
-            if let icon = NSImage(systemSymbolName: "terminal", accessibilityDescription: "Floating Terminal") {
-                icon.isTemplate = true
-                button.image = icon
-            } else {
-                button.title = "FT"
-            }
-            button.toolTip = "Floating Terminal"
-        }
-
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Show Terminal", action: #selector(showPanelNow), keyEquivalent: ""))
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit Floating Terminal", action: #selector(quitApp), keyEquivalent: "q"))
-        menu.items.forEach { $0.target = self }
-        item.menu = menu
-        statusItem = item
-    }
 }
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
-app.setActivationPolicy(.accessory)
 app.delegate = delegate
 app.run()
